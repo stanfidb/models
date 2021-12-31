@@ -334,6 +334,7 @@ print(anygreaterp7.shape)
 positiveflags = greaterp7 | (~anygreaterp7[..., tf.newaxis] & maxiousflags)
 positiveflags_anygtruth = tf.reduce_any(positiveflags, axis=-1)
 negativeflags = alllesserp3 & ~positiveflags_anygtruth
+neitherflags = ~positiveflags_anygtruth & ~negativeflags
 
 # Note: When training for positive gtruth regression, we have the choice
 #   of fitting to multiple gtruths or any of them (positive gtruths-anchor pairs)
@@ -373,6 +374,22 @@ print(positiveflags.shape)
 lambd = 1.0
 reg_loss = lambd * tf.reduce_mean(tf.where(positiveflags, reg_loss, 0.))
 print(reg_loss)
+
+# Handle cls loss: 
+#   - binary crossentropy
+print(cls.shape) # Note: output activ of layer is sigmoid (ie. b/w [0,1])
+print(positiveflags_anygtruth.shape)
+print(negativeflags.shape)
+print(neitherflags.shape)
+gtruthflags = tf.stack([positiveflags_anygtruth, negativeflags], axis=-1)
+gtruthflags.shape
+# Use tf.gather(_nd?) and tf.where
+posneg_cls = tf.gather_nd(cls, tf.where(~neitherflags))
+posneg_gtruth = tf.gather_nd(gtruthflags, tf.where(~neitherflags))
+cls_loss = keras.losses.binary_crossentropy(tf.cast(posneg_gtruth, tf.float32),
+                                            posneg_cls, from_logits=False)
+cls_loss = tf.reduce_mean(cls_loss)
+print(cls_loss)
 
 fig, ax = plt.subplots()
 plot_rcnn_bboxes(ax, image, bboxes, labels)
