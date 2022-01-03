@@ -367,27 +367,84 @@ gtruth_paramtzd = parameterize_rcnn_bbox(voc_to_rcnn_bbox(gtruth_voc_bboxes),
 print(gtruth_paramtzd.shape)
 print(reg_paramtzd.shape)
 
-reg_loss = keras.losses.huber(gtruth_paramtzd, reg_paramtzd[:, :, :, tf.newaxis, :])
-print(reg_loss.shape)
 print(positiveflags.shape)
-# Set lambda param
+print(negativeflags.shape)
+
+# from prev step
+reg_paramtzd = parameterize_rcnn_bbox(reg, voc_to_rcnn_bbox(anchor_voc_bboxes[:, :, :, 0, :]))
+gtruth_paramtzd = parameterize_rcnn_bbox(voc_to_rcnn_bbox(gtruth_voc_bboxes),
+                                         voc_to_rcnn_bbox(anchor_voc_bboxes))
+
+# Implement mini-batch random sampling of 256 anchors:
+#   - ratio of UP TO 1:1 pos:neg samples
+#   - if < 128 pos samples, pad the mini-batch w/ negative ones
+total_samples = 256
+expected_pos = 128
+num_pos_samples = tf.reduce_sum(tf.cast(positiveflags, tf.int32))
+pos_samples_cnt = tf.math.minimum(expected_pos, num_pos_samples)
+neg_samples_cnt = total_samples - pos_samples_cnt
+
+# Randomly sample pos flag indices
+pos_indices = tf.where(positiveflags)
+pos_indices = tf.random.shuffle(pos_indices, 
+                                seed=1337, 
+                                name="Mini-batch sampling (pos)")
+pos_indices = pos_indices[:pos_samples_cnt]
+
+# Randomly sample neg flag indices
+negflags = tf.repeat(negativeflags[..., tf.newaxis], 3, axis=-1)
+neg_indices = tf.where(negflags)
+neg_indices = tf.random.shuffle(pos_indices,
+                                seed=1337,
+                                name="Mini-batch sampling (neg)")
+neg_indices = neg_indices[:neg_samples_cnt]
+
+# Recollect the gtruth_paramtzd and reg_paramtzd using indices
+#   - Note: don't need 4th index when gathering bbox reg output since
+#       the output is the same for all gtruths (ie. not gtruth specific)
+sampled_indices = tf.concat([pos_indices, neg_indices], axis=0)
+print(sampled_indices.shape)
+print(gtruth_paramtzd.shape)
+print(reg_paramtzd.shape)
+gtruth_paramtzd = tf.gather_nd(gtruth_paramtzd, sampled_indices)
+reg_paramtzd = tf.gather_nd(reg_paramtzd, sampled_indices[:, :3])
+print(gtruth_paramtzd.shape)
+print(reg_paramtzd.shape)
+
+# Handle RPN bbox regression loss
+
+# If doing all - unnecessary dim expand after sampling step above
+#reg_loss = keras.losses.huber(gtruth_paramtzd, reg_paramtzd[:, :, :, tf.newaxis, :])
+#reg_loss = lambd * tf.reduce_mean(tf.where(positiveflags, reg_loss, 0.))
+
 lambd = 1.0
-reg_loss = lambd * tf.reduce_mean(tf.where(positiveflags, reg_loss, 0.))
+reg_loss = keras.losses.huber(gtruth_paramtzd, reg_paramtzd)
+reg_loss = lambd * tf.reduce_mean(reg_loss)
+print(reg_loss.shape)
 print(reg_loss)
 
 # Handle cls loss: 
 #   - binary crossentropy
 print(cls.shape) # Note: output activ of layer is sigmoid (ie. b/w [0,1])
-print(positiveflags_anygtruth.shape)
-print(negativeflags.shape)
-print(neitherflags.shape)
-gtruthflags = tf.stack([positiveflags_anygtruth, negativeflags], axis=-1)
-gtruthflags.shape
-# Use tf.gather(_nd?) and tf.where
-posneg_cls = tf.gather_nd(cls, tf.where(~neitherflags))
-posneg_gtruth = tf.gather_nd(gtruthflags, tf.where(~neitherflags))
-cls_loss = keras.losses.binary_crossentropy(tf.cast(posneg_gtruth, tf.float32),
-                                            posneg_cls, from_logits=False)
+
+# if training on all
+#gtruthflags = tf.stack([positiveflags_anygtruth, negativeflags], axis=-1)
+#posneg_cls = tf.gather_nd(cls, tf.where(~neitherflags))
+#posneg_gtruth = tf.gather_nd(gtruthflags, tf.where(~neitherflags))
+#cls_loss = keras.losses.binary_crossentropy(tf.cast(posneg_gtruth, tf.float32),
+#                                             posneg_cls, from_logits=False)
+
+# As before, don't need gtruth specific for cls output - can drop 4th index
+cls_sampled = tf.gather_nd(cls, sampled_indices[:, :3])
+# We know the samples are ordered by pos then neg samples, can create tar val
+#   - technically not sampled - figure out naming later
+posflags_sampled = tf.repeat([[1.,0.]], pos_samples_cnt, axis=0)
+negflags_sampled = tf.repeat([[0.,1.0]], neg_samples_cnt, axis=0)
+gtruthflags_sampled = tf.concat([posflags_sampled, negflags_sampled], axis=0)
+print(cls_sampled.shape)
+print(gtruthflags_sampled.shape)
+cls_loss = keras.losses.binary_crossentropy(gtruthflags_sampled,
+                                            cls_sampled, from_logits=False)
 cls_loss = tf.reduce_mean(cls_loss)
 print(cls_loss)
 
