@@ -32,6 +32,7 @@ Original file is located at
 
 import numpy as np
 import tensorflow as tf
+import tensorflow_addons as tfa
 from tensorflow import keras
 from tensorflow.keras import layers
 
@@ -107,12 +108,18 @@ def rcnn_to_pyplot_norm_bbox(rcnn_bbox):
     #   - for imshow: top-left is (0,0)
     new_xmin = center_x - width/2.
     new_ymin = center_y - height/2.
-    return tf.concat([new_xmin, new_ymin, width, height], axis=-1)
+
+    # For cross-boundary crops, easier to go from voc -> pyplot
+    voc_bbox = rcnn_to_voc_bbox(rcnn_bbox)
+    plt_bbox = voc_to_pyplot_norm_bbox(voc_bbox)
+    return plt_bbox
 
 # UNTESTED
 def voc_to_pyplot_norm_bbox(voc_bbox):
     # Note: top left is (0,0), bot right is (max,max)
     #   - values are normalized b/w [0,1]
+    # Crop cross-boundary boxes for plotting
+    voc_bbox = tf.clip_by_value(voc_bbox, 0., 1.)
     ymin, xmin, ymax, xmax = tf.split(voc_bbox, num_or_size_splits=4, axis=-1)
     # Pyplot is in ((xmin, ymin), width, height) format
     #   - NOT normalized for plotting, will leave normalized for now
@@ -261,6 +268,8 @@ print(cls.shape)
     - (i) IF NON-POSITIVE anchor AND IF IoU < 0.3 for ALL gtruth bboxes
 - Neither:
     - Ignore during training
+
+#### Compartmentalized methods
 """
 
 def parameterize_rcnn_bbox(input_bbox, anchor_bbox):
@@ -281,189 +290,218 @@ def parameterize_rcnn_bbox(input_bbox, anchor_bbox):
     th = tf.math.log(height / height_a)
     return tf.concat([tx, ty, tw, th], axis=-1)
 
-# Note: Loss handling will be done by final class handler
-import tensorflow_addons as tfa
+def create_rcnn_anchors(feat_H, feat_W,
+                        scales=[128., 256., 512.], aspects=[1., .5, 2.]):
+    # Create anchor values using linspace -> meshgrid
+    _, feat_H, feat_W, _ = tf.shape(features) # features :: (batch_dim=1, feat_H, feat_W, feat_C)
+    
+    # Generate relative sized anchor centers
+    #   - creating matrix of anchor over feat_H x feat_W space
+    H_linspace = tf.linspace(start=0., stop=1., num=feat_H)
+    W_linspace = tf.linspace(start=0., stop=1., num=feat_W)
+    anchor_centers = tf.stack(tf.meshgrid(W_linspace, H_linspace), axis=-1) # :: (feat_H, feat_W, 2)
+    
+    # Generate relative sized height and width of anchor
+    #   - meshgrid generates combinations of scales x aspects
+    anchor_W, anchor_Hscales = tf.meshgrid(scales, aspects)
+    anchor_H = anchor_W * anchor_Hscales
+    anchor_W_H = tf.stack([anchor_W, anchor_H], axis=-1)
+    anchor_W_H = tf.reshape(anchor_W_H, [-1, 2]) # :: (9,2)
+    anchor_W_H = anchor_W_H * tf.concat([1./tf.cast(img_W, tf.float32),
+                                        1./tf.cast(img_H, tf.float32)], axis=0)
+    
+    # Get complete relative sized anchor bboxes 4 coords
+    #   - broadcast for compatible shapes
+    k = 9
+    # anchor_centers :: (feat_H, feat_W, 2) --> (feat_H, feat_W, k, 2)
+    # anchor_W_H :: (k, 2) --> (feat_H, feat_W, k, 2)
+    # anchor_rcnn_bboxes :: (feat_H, feat_W, k, 4)
+    anchor_centers = tf.broadcast_to(anchor_centers[:, :, tf.newaxis, :], shape=[feat_H, feat_W, k, 2])
+    anchor_W_H = tf.broadcast_to(anchor_W_H, shape=[feat_H, feat_W, k, 2])
+    anchor_rcnn_bboxes = tf.concat([anchor_centers, anchor_W_H], axis=-1) # :: (feat_H, feat_W, 9, 4)
 
-crossbound_masking = False
+    return anchor_rcnn_bboxes
 
-# Note: gtruth bboxes from dataset are in rcnn format
-#   - DEBUG: Inconvenient if axes match - hard set to 3
-gtruth_rcnn_bboxes = bboxes[:3, :] # Leftover from exposed code testing :: (# gtruth bboxes, 4)
-num_gt_bboxes, _ = tf.shape(gtruth_rcnn_bboxes)
+def generate_crossbound_mask(anchor_voc_bboxes):
+    # Generate cross-boundary anchor mask to ignore during training
+    #   - recall: VOC format - (ymin, xmin, ymax, xmax)
+    #   - recall: values are normalized (ie. check for >1 and <0)
+    crossbounds_mask = (anchor_voc_bboxes > 1.) | (anchor_voc_bboxes < 0.) # :: (feat_H, feat_W, k, 4)
+    crossbounds_mask = tf.reduce_any(crossbounds_mask, axis=-1) # :: (feat_H, feat_W, k)
+    crossbounds_mask = ~crossbounds_mask # TRUE if mask doesn't extend, FALSE if out of bounds
+    return crossbounds_mask
 
-# OVERVIEW:
-#   1) Generate k(=9) anchors for each position in feature layer output
-#   2) Calculate IoU b/w each anchor wrt ALL gtruth bboxes
-#   3) Flag the anchors according to the IoU rules
+def generate_voc_anchor_labels(anchor_voc_bboxes, gtruth_voc_bboxes, crossbound_mask=None):
+    # Calculate IoU b/w all anchors and all gtruth bboxes:
+    #   - Note: L_IoU = 1 - IoU
+    anchor_voc_bboxes = anchor_voc_bboxes[:, :, :, tf.newaxis, :] # :: (feat_H, feat_W, k, 1, 4)
+    IoUs = 1. - tfa.losses.giou_loss(gtruth_voc_bboxes, anchor_voc_bboxes, mode='iou') # :: (feat_H, feat_W, k, # of gtruth bboxes)
+    
+    # Flag the anchors according to IoU
+    #   - '_pergt' :: (feat_H, feat_W, k, # of gtruth bboxes)
+    #       - ie. retains info for each gtruth bbox wrt each anchor
+    #   - '_anygt' :: (feat_H, feat_W, k)
+    #       - ie. condition is true/false wrt ANY of the k anchors
+    #   - '_allgt' :: (feat_H, faet_W, k)
+    #       0 ie. condition is true/false wrt ALL of the k anchors
+    greaterp7_pergt = IoUs > 0.7
+    greaterp7_anygt = tf.reduce_any(greaterp7_pergt, axis=-1) # (i)
+    lesserp3_pergt  = IoUs < 0.3
+    lesserp3_allgt = tf.reduce_all(lesserp3_pergt, axis=-1)
+    
+    # Maximum IoU across all k anchors (per position) and all gtruth bboxes
+    #   - flag each anchor true if it equals max iou in anchor set
+    maxious = tf.reduce_max(IoUs, axis=[-1,-2]) # :: (feat_H, feat_W)
+    maxiousflags = (maxious[..., tf.newaxis, tf.newaxis] == IoUs) # :: (featu_H, feat_W, k, # of gtruth bboxes)
+    
+    # Below handles the two positive cases
+    #   - Note: python bitwise operators work as logical operators w/ tf bools
+    #   - positiveflags(_pergt/_anygt) :: (feat_H, feat_W, k[, # of gtruth bboxes])
+    #   - negativeflags(_pergt/_allgt) :: (feat_H, feat_W, k[, # of gtruth bboxes])
+    
+    # "Anchor is positive if IoU > 0.7 OR none of the anchors in the set have IoU > 0.7 but are max IoU"
+    #   - corresponds to cond. for Positive (i)/(ii)
+    #   - APPLY crossbound masking
+    positiveflags_pergt = greaterp7_pergt | (~greaterp7_anygt[..., tf.newaxis] & maxiousflags)
+    if crossbound_masking: positiveflags_pergt = crossbounds_mask[..., tf.newaxis] & positiveflags_pergt
+    positiveflags_anygt = tf.reduce_any(positiveflags_pergt, axis=-1)
+    
+    # "Anchor is negative if none of the anchors in the set are positive AND the IoU < 0.3 for all gtruth bboxes"
+    #   - corresponds to cond. for Negative (i)
+    #   - APPLY crossbound masking
+    #   - Note: a corrolary to the rules is that IFF ANY anchor in the set is negative, ALL will be negative 
+    negativeflags_allgt = ~positiveflags_anygt & lesserp3_allgt 
+    if crossbound_masking: negativeflags_allgt = crossbounds_mask & negativeflags_allgt
+    negativeflags_pergt = tf.repeat(negativeflags_allgt[..., tf.newaxis], num_gt_bboxes, axis=-1)
+    
+    # "Anchor is neither positive nor negative"
+    #   - corresonds to cond. for Neither
+    neitherflags_pergt = ~positiveflags_pergt & ~negativeflags_pergt
 
-# Values for creating anchor set - static for now
-scales = [128., 256., 512.]
-aspects = [1., .5, 2.]
+    return (positiveflags_pergt, positiveflags_anygt, negativeflags_allgt, negativeflags_pergt, neitherflags_pergt)
 
-# Create anchor values using linspace -> meshgrid
-img_H, img_W, _ = tf.shape(image) # image :: (img_H, img_W, img_C)
-_, feat_H, feat_W, _ = tf.shape(features) # features :: (batch_dim=1, feat_H, feat_W, feat_C)
+def calc_reg_loss(reg_paramtzd, gtruth_paramtzd):
+    # Handle RPN 'reg' loss
+    #   - paper specifies "Robust Loss (L1)", Huber is close enough
+    reg_loss = keras.losses.huber(gtruth_paramtzd, reg_paramtzd)
+    reg_loss = tf.reduce_mean(reg_loss)
+    return reg_loss
 
-# Generate relative sized anchor centers
-#   - creating matrix of anchor over feat_H x feat_W space
-H_linspace = tf.linspace(start=0., stop=1., num=feat_H)
-W_linspace = tf.linspace(start=0., stop=1., num=feat_W)
-anchor_centers = tf.stack(tf.meshgrid(W_linspace, H_linspace), axis=-1) # :: (feat_H, feat_W, 2)
+def calc_cls_loss(cls, sampled_indices,
+                  pos_samples_cnt, neg_samples_cnt):
+    # Handle RPN 'cls' loss
+    #   - binary crossentropy
+    #   - Note: can drop 4th index in indices since cls not gtruth specific
+    #   - Note: unnecessary to use gather for positiveflags/negativeflags since
+    #       we know the values [1.,0.]/[0.,1.] and the ordering (<=128pos, rest neg)
+    cls_sampled = tf.gather_nd(cls, sampled_indices[:, :3])
+    cls_tar_pos = tf.repeat([[1.,0.]], pos_samples_cnt, axis=0)
+    cls_tar_neg = tf.repeat([[0.,1.0]], neg_samples_cnt, axis=0)
+    cls_tar = tf.concat([cls_tar_pos, cls_tar_neg], axis=0)
+    cls_loss = keras.losses.binary_crossentropy(cls_tar,
+                                                cls_sampled,
+                                                from_logits=False)
+    cls_loss = tf.reduce_mean(cls_loss)
+    return cls_loss
 
-# Generate relative sized height and width of anchor
-#   - meshgrid generates combinations of scales x aspects
-anchor_W, anchor_Hscales = tf.meshgrid(scales, aspects)
-anchor_H = anchor_W * anchor_Hscales
-anchor_W_H = tf.stack([anchor_W, anchor_H], axis=-1)
-anchor_W_H = tf.reshape(anchor_W_H, [-1, 2]) # :: (9,2)
-anchor_W_H = anchor_W_H * tf.concat([1./tf.cast(img_W, tf.float32),
-                                     1./tf.cast(img_H, tf.float32)], axis=0)
+def gather_minibatch(positiveflags_pergt, negativeflags_pergt,
+                     reg_paramtzd, gtruth_paramtzd,
+                     total_samples=256, desired_positive=128):
+    # Implementation of mini-batch random sampling of 256 anchors
+    #   - Note: still wrt each ground truth
+    num_pos_samples = tf.reduce_sum(tf.cast(positiveflags_pergt, tf.int32))
+    pos_samples_cnt = tf.math.minimum(desired_positive, num_pos_samples)
+    neg_samples_cnt = total_samples - pos_samples_cnt
+    
+    # Randomly sample positive flag indices
+    pos_indices = tf.where(positiveflags_pergt)
+    pos_indices = tf.random.shuffle(pos_indices, 
+                                    seed=1337, 
+                                    name="Mini-batch sampling (+)")
+    pos_indices = pos_indices[:pos_samples_cnt]
+    
+    # Randomly sample neg flag indices
+    neg_indices = tf.where(negativeflags_pergt)
+    neg_indices = tf.random.shuffle(pos_indices,
+                                    seed=1337,
+                                    name="Mini-batch sampling (neg)")
+    neg_indices = neg_indices[:neg_samples_cnt]
+    
+    # Sample gtruth_paramtzd and reg_paramtzd according to indices
+    #   - Note: don't need 4th index when gathering RPN reg output since
+    #       the output is the same for all gtruths (ie. not gtruth specific)
+    #       - ie. the network doesnt output a bbox per gtruth, only per anchor
+    sampled_indices = tf.concat([pos_indices, neg_indices], axis=0)
+    gtruth_paramtzd = tf.gather_nd(gtruth_paramtzd, sampled_indices)
+    reg_paramtzd = tf.gather_nd(reg_paramtzd, sampled_indices[:, :3])
 
-# Get complete relative sized anchor bboxes 4 coords
-#   - broadcast for compatible shapes
-k = 9
-# anchor_centers :: (feat_H, feat_W, 2) --> (feat_H, feat_W, k, 2)
-# anchor_W_H :: (k, 2) --> (feat_H, feat_W, k, 2)
-# anchor_rcnn_bboxes :: (feat_H, feat_W, k, 4)
-anchor_centers = tf.broadcast_to(anchor_centers[:, :, tf.newaxis, :], shape=[feat_H, feat_W, k, 2])
-anchor_W_H = tf.broadcast_to(anchor_W_H, shape=[feat_H, feat_W, k, 2])
-anchor_rcnn_bboxes = tf.concat([anchor_centers, anchor_W_H], axis=-1) # :: (feat_H, feat_W, 9, 4)
+    return (reg_paramtzd, gtruth_paramtzd, sampled_indices, pos_samples_cnt, neg_samples_cnt)
 
-# Convert from rcnn format to voc format
-#   - Note: Some anchors will extend over edge of image
-#   - Note: Assuming reg output is in rcnn format, can change assumption if desired
-# UNVERIFIED that reshape isn't rearranging bboxes (or if that would be an issue)
-gtruth_voc_bboxes = rcnn_to_voc_bbox(gtruth_rcnn_bboxes) # :: (# gtruth bboxes, 4)
-anchor_voc_bboxes = rcnn_to_voc_bbox(anchor_rcnn_bboxes) # :: (feat_H, feat_W, k, 4)
+"""#### Combined methods"""
 
-# Generate cross-boundary anchor mask to ignore during training
-#   - recall: VOC format - (ymin, xmin, ymax, xmax)
-#   - recall: values are normalized (ie. check for >1 and <0)
-crossbounds_mask = (anchor_voc_bboxes > 1.) | (anchor_voc_bboxes < 0.) # :: (feat_H, feat_W, k, 4)
-crossbounds_mask = tf.reduce_any(crossbounds_mask, axis=-1) # :: (feat_H, feat_W, k)
-crossbounds_mask = ~crossbounds_mask # TRUE if mask doesn't extend, FALSE if out of bounds
+def get_rpn_bboxes_and_losses(reg, cls, features, 
+                              gtruth_rcnn_bboxes):
+    # Note: gtruth bboxes from dataset are in rcnn format
+    #   - DEBUG: Inconvenient if axes match - hard set to 3
+    gtruth_rcnn_bboxes = gtruth_rcnn_bboxes[:3, :] # Leftover from exposed code testing :: (# gtruth bboxes, 4)
+    num_gt_bboxes, _ = tf.shape(gtruth_rcnn_bboxes)
+                                
+    # Step 1) Generate anchor bboxes
+    _, feat_H, feat_W, _ = tf.shape(features)
+    anchor_rcnn_bboxes = create_rcnn_anchors(feat_H, feat_W)
+    
+    # Convert from rcnn format to voc format
+    anchor_voc_bboxes = rcnn_to_voc_bbox(anchor_rcnn_bboxes)
+    gtruth_voc_bboxes = rcnn_to_voc_bbox(gtruth_rcnn_bboxes)
+    
+    # Step 2) Generate anchor labels
+    #   - w/ Optional cross-bound masking
+    crossbound_masking = False
+    crossbound_mask = generate_crossbound_mask(anchor_voc_bboxes)
+    
+    (positiveflags_pergt, positiveflags_anygt, 
+    negativeflags_allgt, negativeflags_pergt, 
+    neitherflags_pergt) = generate_voc_anchor_labels(anchor_voc_bboxes, gtruth_voc_bboxes, crossbound_mask)
+    
+    # Step 3) Parameterize reg output and gtruth bboxes 
+    reg_paramtzd = parameterize_rcnn_bbox(reg, anchor_rcnn_bboxes)
+    gtruth_paramtzd = parameterize_rcnn_bbox(gtruth_rcnn_bboxes, anchor_rcnn_bboxes[:, :, :, tf.newaxis, :])
+    
+    # Step 4) Randomly sample a mini-batch of training samples
+    (reg_paramtzd, gtruth_paramtzd, sampled_indices,
+    pos_samples_cnt, neg_samples_cnt) = gather_minibatch(positiveflags_pergt, negativeflags_pergt,
+                                                        reg_paramtzd, gtruth_paramtzd)
+    
+    # Step 5) Calculate reg + cls loss and combine
+    lambd = 1.0
+    reg_loss = calc_reg_loss(reg_paramtzd, gtruth_paramtzd)
+    cls_loss = calc_cls_loss(cls, sampled_indices, pos_samples_cnt, neg_samples_cnt)
+    #total_loss = cls_loss + lambd * reg_loss
+    
+    return reg_paramtzd, {"cls_loss": cls_loss, "reg_loss": reg_loss}
 
-# Calculate IoU b/w all anchors and all gtruth bboxes:
-#   - Note: L_IoU = 1 - IoU
-anchor_voc_bboxes = anchor_voc_bboxes[:, :, :, tf.newaxis, :] # :: (feat_H, feat_W, k, 1, 4)
-IoUs = 1. - tfa.losses.giou_loss(gtruth_voc_bboxes, anchor_voc_bboxes, mode='iou') # :: (feat_H, feat_W, k, # of gtruth bboxes)
+get_rpn_bboxes_and_losses(reg, cls, features,
+                          bboxes)
 
-# Flag the anchors according to IoU
-#   - '_pergt' :: (feat_H, feat_W, k, # of gtruth bboxes)
-#       - ie. retains info for each gtruth bbox wrt each anchor
-#   - '_anygt' :: (feat_H, feat_W, k)
-#       - ie. condition is true/false wrt ANY of the k anchors
-#   - '_allgt' :: (feat_H, faet_W, k)
-#       0 ie. condition is true/false wrt ALL of the k anchors
-greaterp7_pergt = IoUs > 0.7
-greaterp7_anygt = tf.reduce_any(greaterp7_pergt, axis=-1) # (i)
-lesserp3_pergt  = IoUs < 0.3
-lesserp3_allgt = tf.reduce_all(lesserp3_pergt, axis=-1)
+## Paper gives example of 1000x600 input w/ 60x40x9 ~ 20,000 anchors
+##   where 6,000 are not cross-boundary (ie. 6000/20000 = 30% valid)
+#a = tf.reduce_prod(tf.shape(crossbounds_mask))
+#b = tf.reduce_sum(tf.cast(crossbounds_mask, tf.int32))
+#print(image.shape)
+#print(features.shape)
+#print(a.numpy(), b.numpy(), (b / a).numpy())
 
-# Maximum IoU across all k anchors (per position) and all gtruth bboxes
-#   - flag each anchor true if it equals max iou in anchor set
-maxious = tf.reduce_max(IoUs, axis=[-1,-2]) # :: (feat_H, feat_W)
-maxiousflags = (maxious[..., tf.newaxis, tf.newaxis] == IoUs) # :: (featu_H, feat_W, k, # of gtruth bboxes)
+reg.shape, cls.shape
 
-# Below handles the two positive cases
-#   - Note: python bitwise operators work as logical operators w/ tf bools
-#   - positiveflags(_pergt/_anygt) :: (feat_H, feat_W, k[, # of gtruth bboxes])
-#   - negativeflags(_pergt/_allgt) :: (feat_H, feat_W, k[, # of gtruth bboxes])
+N = 10
+vals, indices = tf.math.top_k(tf.reshape(cls[..., 0], [-1]), k=N)
+obj_reg = tf.gather_nd(tf.reshape(reg, [-1, 4]), indices[...,tf.newaxis])
 
-# "Anchor is positive if IoU > 0.7 OR none of the anchors in the set have IoU > 0.7 but are max IoU"
-#   - corresponds to cond. for Positive (i)/(ii)
-#   - APPLY crossbound masking
-positiveflags_pergt = greaterp7_pergt | (~greaterp7_anygt[..., tf.newaxis] & maxiousflags)
-if crossbound_masking: positiveflags_pergt = crossbounds_mask[..., tf.newaxis] & positiveflags_pergt
-positiveflags_anygt = tf.reduce_any(positiveflags_pergt, axis=-1)
-
-# "Anchor is negative if none of the anchors in the set are positive AND the IoU < 0.3 for all gtruth bboxes"
-#   - corresponds to cond. for Negative (i)
-#   - APPLY crossbound masking
-#   - Note: a corrolary to the rules is that IFF ANY anchor in the set is negative, ALL will be negative 
-negativeflags_allgt = ~positiveflags_anygt & lesserp3_allgt 
-if crossbound_masking: negativeflags_allgt = crossbounds_mask & negativeflags_allgt
-negativeflags_pergt = tf.repeat(negativeflags_allgt[..., tf.newaxis], num_gt_bboxes, axis=-1)
-
-# "Anchor is neither positive nor negative"
-#   - corresonds to cond. for Neither
-neitherflags_pergt = ~positiveflags_pergt & ~negativeflags_pergt
-
-# Overview:
-#   1) Parameterize RPN reg output and ground truth bboxes
-#   2) Randomly sample per-image mini-batch of 256 anchors
-#       - ratio UP TO 1:1 of positive to negative samples
-#       - IF < 128 positive samples, pad the mini-batch w/ negative ones
-#   3) Calculate 'reg' loss
-#   4) Calculate 'cls' loss
-#   5) Sum losses w/ lambda factor difference
-
-# Parameterize the RPN reg output and the ground truth bboxes
-reg_paramtzd = parameterize_rcnn_bbox(reg, anchor_rcnn_bboxes)
-gtruth_paramtzd = parameterize_rcnn_bbox(gtruth_rcnn_bboxes, anchor_rcnn_bboxes[:, :, :, tf.newaxis, :])
-
-# Implementation of mini-batch random sampling of 256 anchors
-#   - Note: still wrt each ground truth
-total_samples = 256
-desired_positive = 128
-num_pos_samples = tf.reduce_sum(tf.cast(positiveflags_pergt, tf.int32))
-pos_samples_cnt = tf.math.minimum(desired_positive, num_pos_samples)
-neg_samples_cnt = total_samples - pos_samples_cnt
-
-# Randomly sample positive flag indices
-pos_indices = tf.where(positiveflags_pergt)
-pos_indices = tf.random.shuffle(pos_indices, 
-                                seed=1337, 
-                                name="Mini-batch sampling (+)")
-pos_indices = pos_indices[:pos_samples_cnt]
-
-# Randomly sample neg flag indices
-neg_indices = tf.where(negativeflags_pergt)
-neg_indices = tf.random.shuffle(pos_indices,
-                                seed=1337,
-                                name="Mini-batch sampling (neg)")
-neg_indices = neg_indices[:neg_samples_cnt]
-
-# Sample gtruth_paramtzd and reg_paramtzd according to indices
-#   - Note: don't need 4th index when gathering RPN reg output since
-#       the output is the same for all gtruths (ie. not gtruth specific)
-#       - ie. the network doesnt output a bbox per gtruth, only per anchor
-sampled_indices = tf.concat([pos_indices, neg_indices], axis=0)
-gtruth_paramtzd = tf.gather_nd(gtruth_paramtzd, sampled_indices)
-reg_paramtzd = tf.gather_nd(reg_paramtzd, sampled_indices[:, :3])
-
-# Handle RPN 'reg' loss
-#   - paper specifies "Robust Loss (L1)", Huber is close enough
-lambd = 1.0
-reg_loss = keras.losses.huber(gtruth_paramtzd, reg_paramtzd)
-reg_loss = lambd * tf.reduce_mean(reg_loss)
-
-# Handle RPN 'cls' loss
-#   - binary crossentropy
-#   - Note: can drop 4th index in indices since cls not gtruth specific
-#   - Note: unnecessary to use gather for positiveflags/negativeflags since
-#       we know the values [1.,0.]/[0.,1.] and the ordering (<=128pos, rest neg)
-cls_sampled = tf.gather_nd(cls, sampled_indices[:, :3])
-cls_tar_pos = tf.repeat([[1.,0.]], pos_samples_cnt, axis=0)
-cls_tar_neg = tf.repeat([[0.,1.0]], neg_samples_cnt, axis=0)
-cls_tar = tf.concat([cls_tar_pos, cls_tar_neg], axis=0)
-cls_loss = keras.losses.binary_crossentropy(cls_tar,
-                                            cls_sampled,
-                                            from_logits=False)
-cls_loss = tf.reduce_mean(cls_loss)
-
-print(cls_loss, reg_loss) # Expected cls ~ 3.35; reg ~ 7.0
-
-# Paper gives example of 1000x600 input w/ 60x40x9 ~ 20,000 anchors
-#   where 6,000 are not cross-boundary (ie. 6000/20000 = 30% valid)
-a = tf.reduce_prod(tf.shape(crossbounds_mask))
-b = tf.reduce_sum(tf.cast(crossbounds_mask, tf.int32))
-print(image.shape)
-print(features.shape)
-print(a.numpy(), b.numpy(), (b / a).numpy())
+print_bbox_formats()
 
 fig, ax = plt.subplots()
-plot_rcnn_bboxes(ax, image, bboxes, labels)
+plot_rcnn_bboxes(ax, image, bboxes, labels, show_labels=False,
+                 pred_bboxes=obj_reg, pred_labels=None)
 image.shape
 
 print_bbox_formats()
@@ -471,8 +509,8 @@ print_bbox_formats()
 """### RoI Pooling"""
 
 # Inputs:
-#   - RoI BBoxes
-#   - Features
+#   - RPN BBoxes (reg -- rcnn format)
+#   - Features (from shared feature extractor network (VGG) )
 #
 # Outputs:
 #   - RoI Feature Vectors
@@ -486,36 +524,58 @@ class RoIPool(keras.Model):
         self.fc1 = layers.Dense(32)
         self.fc2 = layers.Dense(64)
 
-    def pool_roi(self, roi):
-        # roi :: (None, None, 512)
-        # pooled_roi :: (7, 7, 512)
-        roishape = tf.shape(roi)
+        self.crop_height = 64
+        self.crop_width  = 64
 
-        input = roishape
-        ksize = [roishape[0] // 7, roishape[1] // 7]
+    def crop_rois(self, reg, features):
+        # reg :: (N(=10), 4) -- rcnn format
+        # features :: (1, feat_H, feat_W, 512)
+
+        # crop_and_resize:
+        #   - expects bbox coords in (ymin, xmin, ymax, xmax) VOC format
+        #   - expects bbox coords to be normalized [0,1]
+        #   - box_indices refer to which element in batch, only one elem. so 0 
+        voc_reg = rcnn_to_voc_bbox(reg)
+        box_indices = tf.zeros([tf.shape(reg)[0]], tf.int32)
+        crop_size = [self.crop_height, self.crop_width]
+        rois_cropped_and_resized = tf.image.crop_and_resize(image=features, 
+                                                            boxes=voc_reg,
+                                                            box_indices=box_indices,
+                                                            crop_size=crop_size)
+        return rois_cropped_and_resized
+        
+    def pool_rois(self, rois):
+        # rois :: (N(=10), crop_height, crop_width, 512)
+        # pooled_roi :: (N(=10), 7, 7, 512)
+
+        ksize = [self.crop_height // 7, self.crop_width // 7]
         strides = ksize
         padding = "SAME"
 
-        pooled_roi = tf.nn.max_pool2d(input=input,
-                                      ksize=ksize,
-                                      strides=strides,
-                                      padding=padding)
-        return pooled_roi
+        rois_pooled = tf.nn.max_pool2d(input=rois,
+                                       ksize=ksize,
+                                       strides=strides,
+                                       padding=padding)
+        return rois_pooled
 
     def call(self, inputs):
-        # inputs -- [image_features, reg]
+        # inputs -- [features, obj_reg]
         # image_features :: (1, None, None, 512)
-        # bboxes :: (~2000, 4)
-        image_features, bbox = inputs
-        bbox_crop = lambda x: tf.image.crop_to_bounding_box(image_features,
-                                                            x[0], x[1], x[2], x[3])
-        rois = tf.map_fn(bbox_crop, bboxes) # :: (~2000, None, None, 512)
-        pooled_rois = tf.map_fn(self.pool, rois) # :: (~2000, 7, 7, 512)
+        # obj_reg :: (~2000, 4)
+        features, obj_reg = inputs
+        rois_cropped_and_resized = self.crop_rois(obj_reg, features)
+        rois_pooled = self.pool_rois(rois_cropped_and_resized)
 
-        x = self.flatten(pooled_rois) # :: (~2000, 7 * 7 * 512)
+        x = self.flatten(rois_pooled) # :: (~2000, 7 * 7 * 512)
         x = self.fc1(x)
         x = self.fc2(x)
         return x # :: (~2000, 64)
+
+roipool = RoIPool()
+# NOTE: Should be passing all positive flagged reg's to the classifier
+#   - should be ~2000 rois, if too many, implement NMS
+res = roipool([features, obj_reg])
+res.shape
 
 """### Classifier"""
 
@@ -524,6 +584,8 @@ output = layers.Dense(1000, activation="softmax")(inputs)
 # Note: could also include an additional bbox regressor
 #   as is the case in Fast RCNN
 headclassifier = keras.Model(inputs=inputs, outputs=output)
+
+headclassifier(res)
 
 """### Full Model"""
 
@@ -535,86 +597,53 @@ class FasterRCNN(keras.Model):
         self.roipool = RoIPool()
         self.headclassifier = headclassifier
 
-    def call(self, input_image):
-        # input_image :: (1, None, None, 3)
+    # TODO: Figure out call/train_step divisions
+    #   - ie. most efficient spot for loss calc.
+    def train_step(self, input_image, gtruth_voc_bboxes):
+        # input_image :: (1, img_H, imgW, 3)
 
-        # features :: (1, None, None, 512)
+        # features :: (1, feat_H, feat_W, 512)
         features = self.base(input_image)
 
-        # reg :: (None, None, 9, 4)
-        # cls :: (None, None, 9, 2)
+        # reg :: (feat_H, feat_W, 9, 4)
+        # cls :: (feat_H, feat_W, 9, 2)
         reg, cls = self.rpn(features)
 
         # Perform parameterization ops on reg
-        # bboxes = f(reg)
+        lambd = 1.0
+        rpn_pred_bboxes, losses = get_rpn_bboxes_and_losses(reg, cls, features,
+                                                            gtruth_voc_bboxes)
+        cls_loss, reg_loss = losses["cls_loss"], losses["reg_loss"]
+        rpn_loss = cls_loss + lambd * reg_loss
+        self.add_loss(lambda: rpn_loss)
 
         # bboxes :: (~2000, 4)
         # roifeaturevectors:: (~2000, 64)
-        roifeaturevectors = self.roipool([features, bboxes])
+        roifeaturevectors = self.roipool([features, rpn_pred_bboxes])
 
         # class_preds :: (~2000, 1000)
         class_preds = self.headclassifier(roifeaturevectors)
 
-        return [class_preds, bboxes]
+        return [class_preds, rpn_pred_bboxes]
 
-def __init__(self, anchor_scales=[128, 256, 512], 
-                       anchor_aspectratios=[1., 2., .5]):
-        super(RoIPool, self).__init__()
-        self.k = len(anchor_scales) * len(anchor_aspectratios)
-        self.anchor_scales = tf.floor(tf.constant(anchor_scales) * basetoreceptive)
-        self.anchor_aspectratios = tf.constant(anchor_aspectratios)
+    #def call():
+        #pass
 
-"""### Region Proposal Network (RPN)
-- input: image of any size
-- output: set of rectangular object proposals, each w/ an "objectness" score
-- black box: 
-    - n x n spatial window slides across feature map output
-        - ie. n x n convolutional layer
-        - w/ n=3, ZF/VGG receptive field size is 171/228 pixels
-    - window maps to lower-dimensional feature (256-d/512-d w/ ReLU)
-    - feed feature into 2 sibling FCNs
-        - Box-regression layer (reg)
-        - Box-classification layer (cls)
-        - ie. 1 x 1 convolutional layers
-    - at each sliding-window location, predict multiple proposals given number of anchors k
-        - therefore, reg layer has 4k outputs encoding coordinates
-            - parameterize w.r.t k reference boxes
-        - therefore, cls layer has 2k outputs estimating probability of object or not object
-        - each anchor has specified scale and aspect ratio
-            - use 3 scales, 3 aspect ratios for k = 9 anchors
-        - translation-invariant anchors:
-            - regress bounding boxes w/ ref to anchor boxes
-    - loss function:
-        - for training, assign binary class label (obj or not) to each anchor
-            - Positive:
-                - anchor/anchors w/ highest IoU overlap w/ ground-truth box (rare case)
-                - OR
-                - anchor that has IoU overlap higher than 0.7 with any ground-truth box (most common case)
-            - single ground-truth box may assign positive labels to multiple anchors
-            - Negative:
-                - non-positive anchor if its IoU ratio is lower than 0.3 for all ground-truth boxes
-            - Neither:
-                - then anchors don't contribute to training
-        - Loss Function defined in paper
-            - Lcls is log loss over two classes
-            - Lreg is robust loss function (ie. smooth L1)
-            - regression loss activated only for positive anchors
-            - normalization by scale factor (optional)
-        - bbox parameterization:
-            - define w/ log and distance from corners of bbox and size of box
-            - essentially, regression from anchor box to nearby ground-truth box
-            - translation-invariant
-    - Training RPNs
-        - stochastic gradient descent
-        - each mini-batch arises from single image containing many positive and negative anchors
-        - to prevent bias towards the more common negative anchors, randomly sample 256 anchors in image w/ up to 1:1 ratio
-            - if fewer than 128 positive samples, pad mini-batch w/ negative ones
-        - randomly initialize all new layers by drawing weights form zero-mean Gauss distrib. w/ std of 0.01
-            - all other layers (ie. shared conv layers) are initialized by pretraining model for ImageNet classification (ie. fine-tune ZF, VGG, etc.)
-        - lr = 0.001 for 60k mini-batches
-        - lr = 0.0001 for next 20k mini-batches
-        - momentum = 0.9
-        - weight decay = 0.0005
+fasterrcnn = FasterRCNN()
+fasterrcnn.train_step(image[tf.newaxis,...], bboxes)
+
+"""### Training RPNs:
+- Training RPNs
+    - stochastic gradient descent
+    - each mini-batch arises from single image containing many positive and negative anchors
+    - to prevent bias towards the more common negative anchors, randomly sample 256 anchors in image w/ up to 1:1 ratio
+        - if fewer than 128 positive samples, pad mini-batch w/ negative ones
+    - randomly initialize all new layers by drawing weights form zero-mean Gauss distrib. w/ std of 0.01
+        - all other layers (ie. shared conv layers) are initialized by pretraining model for ImageNet classification (ie. fine-tune ZF, VGG, etc.)
+    - lr = 0.001 for 60k mini-batches
+    - lr = 0.0001 for next 20k mini-batches
+    - momentum = 0.9
+    - weight decay = 0.000
 
 ## Training: 4-Step Alternating Training
 1. fine-tune pre-trained ImageNet model for RPN
