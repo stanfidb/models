@@ -444,9 +444,17 @@ def gather_minibatch(positiveflags_pergt, negativeflags_pergt,
 
     return (reg_paramtzd, gtruth_paramtzd, sampled_indices, pos_samples_cnt, neg_samples_cnt)
 
+def get_class_tar(labels, sampled_indices, pos_samples_cnt):
+    # sampled_indices format is: (feat_H, feat_W, k, # gtruth box)
+    #   - sampled_indices :: (# of samples, 4)
+    #   - for class_tar, we only care about the gtruth box index
+    pos_sampled_indices = sampled_indices[:pos_samples_cnt]
+    class_tar = tf.gather_nd(labels, pos_sampled_indices[:, 3:4])
+    return class_tar
+
 """#### Combined methods"""
 
-def get_rpn_bboxes_and_losses(reg, cls, features, 
+def get_rpn_bboxes_and_losses(reg, cls, features, labels,
                               img_H, img_W,
                               gtruth_rcnn_bboxes):
     # Note: gtruth bboxes from dataset are in rcnn format
@@ -481,18 +489,24 @@ def get_rpn_bboxes_and_losses(reg, cls, features,
     pos_samples_cnt, neg_samples_cnt) = gather_minibatch(positiveflags_pergt, negativeflags_pergt,
                                                         reg_paramtzd, gtruth_paramtzd)
     
-    # Step 5) Calculate reg + cls loss and combine
+    # Step 5) Get target class of the sampled rois
+    class_tar = get_class_tar(labels, sampled_indices, pos_samples_cnt)
+    
+    # Step 6) Calculate reg + cls loss and combine
     lambd = 1.0
     reg_loss = calc_reg_loss(reg_paramtzd, gtruth_paramtzd)
     cls_loss = calc_cls_loss(cls, sampled_indices, pos_samples_cnt, neg_samples_cnt)
     #total_loss = cls_loss + lambd * reg_loss
     
-    return reg_paramtzd, {"cls_loss": cls_loss, "reg_loss": reg_loss}
+    return reg_paramtzd[:pos_samples_cnt], class_tar, {"cls_loss": cls_loss, "reg_loss": reg_loss}
 
 img_H, img_W, _ = tf.shape(image)
-get_rpn_bboxes_and_losses(reg, cls, features,
-                          img_H, img_W,
-                          bboxes)
+(rpn_proposals, 
+ class_tar, 
+ losses) = get_rpn_bboxes_and_losses(reg, cls, features, labels,
+                                     img_H, img_W,
+                                     bboxes)
+print(rpn_proposals.shape, class_tar.shape)
 
 ## Paper gives example of 1000x600 input w/ 60x40x9 ~ 20,000 anchors
 ##   where 6,000 are not cross-boundary (ie. 6000/20000 = 30% valid)
@@ -591,12 +605,20 @@ res.shape
 """### Classifier"""
 
 inputs = keras.Input(shape=(64))
-output = layers.Dense(1000, activation="softmax")(inputs)
+# 20 classes in VOC
+output = layers.Dense(20, activation="softmax")(inputs)
 # Note: could also include an additional bbox regressor
 #   as is the case in Fast RCNN
 headclassifier = keras.Model(inputs=inputs, outputs=output)
 
 headclassifier(res)
+
+labels
+
+def calc_head_loss(class_tar, class_pred):
+    head_loss = keras.losses.sparse_categorical_crossentropy(class_tar, class_pred, from_logits=False)
+    head_loss = tf.reduce_mean(head_loss)
+    return head_loss
 
 """### Full Model"""
 
@@ -607,6 +629,24 @@ class FasterRCNN(keras.Model):
         self.rpn = RPN()
         self.roipool = RoIPool()
         self.headclassifier = headclassifier
+
+    def call(self, data):
+        # data -- {"bboxes":..., "image":..., "labels":...}
+        # input_image :: (1, img_H, imgW, 3)
+        input_image = data["image"][tf.newaxis,...]
+        # features :: (1, feat_H, feat_W, 512)
+        features = self.base(input_image)
+        # reg :: (feat_H, feat_W, k, 4)
+        # cls :: (feat_H, feat_W, k, 2)
+        reg, cls = self.rpn(features)
+        pos_reg = tf.gather_nd(reg, tf.where(cls[..., 0] > 0.5))
+        # roifeaturevectors
+        roifeaturevectors = self.roipool([features, pos_reg])
+        # classpreds
+        class_preds = self.headclassifier(roifeaturevectors)
+
+        return pos_reg, class_preds
+
 
     # TODO: Figure out call/train_step divisions
     #   - ie. most efficient spot for loss calc.
@@ -625,15 +665,19 @@ class FasterRCNN(keras.Model):
         features = self.base(input_image)
 
         with tf.GradientTape() as tape:
-            # reg :: (feat_H, feat_W, 9, 4)
-            # cls :: (feat_H, feat_W, 9, 2)
+            # reg :: (feat_H, feat_W, k, 4)
+            # cls :: (feat_H, feat_W, k, 2)
             reg, cls = self.rpn(features)
     
-            # Perform parameterization ops on reg
+            # Get proposed bboxes and losses
+            #   - after passing IoU checks (+NMS?) -- ~2000 bboxes
+            #   - TODO: include tar classes with pred_bboxes using anchor as link
             lambd = 1.0
-            rpn_pred_bboxes, losses = get_rpn_bboxes_and_losses(reg, cls, features,
-                                                                img_H, img_W,
-                                                                gtruth_voc_bboxes)
+            (rpn_pred_bboxes, 
+             class_tar, 
+             losses) = get_rpn_bboxes_and_losses(reg, cls, features, labels,
+                                                 img_H, img_W,
+                                                 gtruth_voc_bboxes)
             cls_loss, reg_loss = losses["cls_loss"], losses["reg_loss"]
             rpn_loss = cls_loss + lambd * reg_loss
 
@@ -644,8 +688,11 @@ class FasterRCNN(keras.Model):
             # class_preds :: (~2000, 1000)
             class_preds = self.headclassifier(roifeaturevectors)
 
+            # calc. head classifier loss
+            head_loss = calc_head_loss(class_tar, class_preds)
+
             # TODO: Need to figure out final classifier loss
-            loss = rpn_loss
+            loss = rpn_loss + head_loss
         
         # Calc. gradients
         trainable_vars = self.trainable_variables
@@ -659,7 +706,10 @@ class FasterRCNN(keras.Model):
 
         # Return a dict mapping metric names to current value
         #   - return metrics values for use in progress bar and callbacks
-        return {"reg_loss": reg_loss, "cls_loss": cls_loss, "total_loss": loss}
+        return {"reg_loss": reg_loss, 
+                "cls_loss": cls_loss, 
+                "head_loss": head_loss, 
+                "total_loss": loss}
 
     #def call():
         #pass
@@ -695,7 +745,40 @@ for data in train_ds.take(3):
 
 fasterrcnn = FasterRCNN()
 fasterrcnn.compile(optimizer="adam")
-history = fasterrcnn.fit(train_ds, epochs=1)
+history = fasterrcnn.fit(train_ds, epochs=10)
+
+def plot_history(history):
+    for name,vals in history.history.items():   
+        plt.plot(vals, label=name)
+    plt.legend()
+
+plot_history(history)
+
+# Save the entire model as a SavedModel.
+!mkdir -p saved_weights
+fasterrcnn.save_weights('saved_weights/fasterrcnn_weights')
+
+"""## Inference"""
+
+# Perform inference
+# bboxes_pred :: (# pred. bboxes, 4)
+# class_pred :: (# pred. bboxes, # classes(=20))
+test_sample = next(iter(test_ds.take(1)))
+bboxes_pred, classes_pred = fasterrcnn(test_sample)
+# Get top-k based on class confidence
+labels_pred = tf.argmax(classes_pred, axis=-1)
+labels_pred_val = tf.reduce_max(classes_pred, axis=-1)
+# Use NMS
+nms_bbox_indices = tf.image.non_max_suppression(bboxes_pred, 
+                                                labels_pred_val, 
+                                                max_output_size=10)
+nms_bbox_indices = nms_bbox_indices[..., tf.newaxis]
+nms_bboxes_pred = tf.gather_nd(bboxes_pred, nms_bbox_indices)
+nms_labels_pred = tf.gather_nd(labels_pred, nms_bbox_indices)
+
+# Plot results
+fig, ax = plt.subplots()
+plot_rcnn_bboxes(ax, image, nms_bboxes_pred, nms_labels_pred)
 
 """## Training: 4-Step Alternating Training
 1. fine-tune pre-trained ImageNet model for RPN
@@ -730,67 +813,4 @@ history = fasterrcnn.fit(train_ds, epochs=1)
 ## Experiments:
 - Paper performed experiments on the PASCAL VOC detection benchmark
 - as well as the MS COCO object detection dataset
-
-### Fast R-CNN object detection network
 """
-
-
-
-import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-
-pretrained = tf.keras.applications.vgg16.VGG16(
-    include_top=False, weights='imagenet', classes=1000
-)
-
-pretrained.summary()
-
-class RPN(keras.Model):
-    def __init__(self, pretrained, n=3, k=9):
-        super(RPN, self).__init__()
-        self.pretrained = pretrained
-
-        self.windowmap = keras.Conv2D(512, (n,n), activation="relu")
-        self.reglayer = keras.Conv2D(4*k, (1,1))
-        self.clslayer = keras.Conv2D(2*k, (1,1), activation="sigmoid")
-
-    def call(self, input_images):
-        x = self.pretrained(input_images)
-        x = self.windowmap(input_images)
-        reg = self.reglayer(x)
-        cls = self.clslayer(x)
-
-class Classifier(keras.Model):
-    def __init__(self, pretrained):
-        super(Classifier, self).__init__()
-        self.pretrained = pretrained
-    
-    def call(self, input_images):
-        pass
-
-class FasterRCNN(keras.Model):
-    def __init__(self, RPN, Classifier):
-        super(FasterRCNN, self).__init__()
-        self.RPN = RPN
-        self.Classifier = Classifier
-
-    def compile(self, optimizer):
-        super(FasterRCNN, self).compile()
-        self.optimizer = optimizer
-
-    def call(self, input_images):
-        rpn_out = self.RPN(input_images)
-        classifier_out = self.Classifier(input_images)
-        return tf.concat([rpn_out, classifier_out])
-
-    def train_step(self, input_images):
-        with tf.GradientTape() as tape:
-            out = self(input_images)
-            loss = loss_fn(out, tar)
-        grads = tape.gradient(loss, self.trainable_weights)
-        optimizer = self.optimizer.apply_gradients(
-            zip(grads, self.trainable_weights)
-        )
-        return {"loss": loss}
